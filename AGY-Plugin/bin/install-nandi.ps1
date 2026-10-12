@@ -33,10 +33,30 @@ param(
     [switch]$RunTests,
 
     [Alias("h", "?")]
-    [switch]$Help
+    [switch]$Help,
+
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$RemainingArgs
 )
 
 $ErrorActionPreference = "Stop"
+
+function Invoke-NativeSilent {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(ValueFromRemainingArguments = $true)][string[]]$ArgumentList
+    )
+    $prevPref = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $output = & $FilePath @ArgumentList 2>$null
+        return $output
+    } catch {
+        return $null
+    } finally {
+        $ErrorActionPreference = $prevPref
+    }
+}
 
 function Invoke-EmbeddedPython {
     param(
@@ -56,15 +76,16 @@ function Invoke-EmbeddedPython {
     }
 }
 
-# Parse POSIX-style CLI arguments (--project-id, -p, etc.) passed via $args if not bound
-for ($i = 0; $i -lt $args.Count; $i++) {
-    $arg = $args[$i]
+if (-not $RemainingArgs) { $RemainingArgs = $args }
+# Parse POSIX-style CLI arguments (--project-id, -p, etc.) passed via $RemainingArgs if not bound
+for ($i = 0; $i -lt $RemainingArgs.Count; $i++) {
+    $arg = $RemainingArgs[$i]
     switch -Regex ($arg) {
         '^(-p|--project-id|--project|--gcp-project-id|-project-id)$' {
-            $i++; if ($i -lt $args.Count) { $ProjectId = $args[$i] }
+            $i++; if ($i -lt $RemainingArgs.Count) { $ProjectId = $RemainingArgs[$i] }
         }
         '^(-d|--project-dir|-project-dir)$' {
-            $i++; if ($i -lt $args.Count) { $ProjectDir = $args[$i] }
+            $i++; if ($i -lt $RemainingArgs.Count) { $ProjectDir = $RemainingArgs[$i] }
         }
         '^(--system|-system)$' {
             $System = $true
@@ -179,24 +200,32 @@ Write-Host "============================================================"
 # ------------------------------------------------------------------------------
 Write-Host "`n[Step 1/5] Local Environment & Library Diagnostics..."
 
-# 1.1 Locate Host Python runtime
+# 1.1 Locate Host Python runtime (skipping Windows Store WindowsApps stub)
 $HostPython = $null
-if (Get-Command python -ErrorAction SilentlyContinue) {
-    $HostPython = "python"
-} elseif (Get-Command py -ErrorAction SilentlyContinue) {
-    $HostPython = "py"
-} elseif (Get-Command python3 -ErrorAction SilentlyContinue) {
-    $HostPython = "python3"
-} else {
-    Write-Host "[ERROR] Error: Python is not installed or not available on PATH." -ForegroundColor Red
+$HostPythonCmd = "python"
+foreach ($candidate in @("python", "py", "python3")) {
+    $cmdInfo = Get-Command $candidate -ErrorAction SilentlyContinue
+    if ($cmdInfo -and $cmdInfo.Source -notlike "*\WindowsApps\*") {
+        $verProbe = Invoke-NativeSilent $cmdInfo.Source "--version"
+        if ($LASTEXITCODE -eq 0 -and $verProbe) {
+            $HostPython = $cmdInfo.Source
+            $HostPythonCmd = $candidate
+            break
+        }
+    }
+}
+if (-not $HostPython) {
+    Write-Host "[ERROR] Error: Python is not installed or only the Microsoft Store stub is on PATH." -ForegroundColor Red
     Write-Host "   Nandi requires Python 3.8+ for hooks, CLI, and virtual environment provisioning." -ForegroundColor Red
     Write-Host "   Please install Python from https://www.python.org/downloads/windows/" -ForegroundColor Red
     exit 1
 }
 
-$HostPythonVer = (& $HostPython -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')").Trim()
-$HostMajor = [int](& $HostPython -c "import sys; print(sys.version_info.major)").Trim()
-$HostMinor = [int](& $HostPython -c "import sys; print(sys.version_info.minor)").Trim()
+$VerScript = "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}'); print(sys.version_info.major); print(sys.version_info.minor)"
+$VerLines = @(Invoke-EmbeddedPython -PythonBin $HostPython -ScriptContent $VerScript)
+$HostPythonVer = "$($VerLines[0])".Trim()
+$HostMajor = [int]("$($VerLines[1])".Trim())
+$HostMinor = [int]("$($VerLines[2])".Trim())
 
 if ($HostMajor -lt 3 -or ($HostMajor -eq 3 -and $HostMinor -lt 8)) {
     Write-Host "[ERROR] Error: Host Python version $HostPythonVer is below minimum requirement (>= 3.8)." -ForegroundColor Red
@@ -215,15 +244,14 @@ if ($UseVenv) {
 
     if (-not (Test-Path $VenvDir)) {
         Write-Host "  Initializing isolated virtual environment at $VenvDir..."
-        try {
-            & $HostPython -m venv $VenvDir
-        } catch {
-            Write-Host "  [INFO] Note: 'ensurepip' unavailable. Retrying with --without-pip..."
-            if (Test-Path $VenvDir) { Remove-Item -Path $VenvDir -Recurse -Force }
-            try {
-                & $HostPython -m venv --without-pip $VenvDir
-            } catch {
+        $null = Invoke-NativeSilent $HostPython "-m" "venv" $VenvDir
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "  [INFO] Note: 'ensurepip' unavailable or blocked. Retrying with --without-pip..."
+            if (Test-Path $VenvDir) { Remove-Item -Path $VenvDir -Recurse -Force -ErrorAction SilentlyContinue }
+            $null = Invoke-NativeSilent $HostPython "-m" "venv" "--without-pip" $VenvDir
+            if ($LASTEXITCODE -ne 0) {
                 Write-Host "  [WARN] Warning: Unable to create virtual environment. Falling back to host python..."
+                if (Test-Path $VenvDir) { Remove-Item -Path $VenvDir -Recurse -Force -ErrorAction SilentlyContinue }
                 $UseVenv = $false
             }
         }
@@ -233,16 +261,19 @@ if ($UseVenv) {
 
     if ($UseVenv) {
         $PythonExec = Join-Path $VenvDir "Scripts\python.exe"
-        if (-not (Test-Path $PythonExec)) {
-            Write-Host "[ERROR] Error: Virtual environment python binary not found: $PythonExec" -ForegroundColor Red
-            exit 1
-        }
-        Write-Host "  [OK] Virtual environment verified: $VenvDir"
+        $venvProbe = if (Test-Path $PythonExec) { Invoke-NativeSilent $PythonExec "--version" } else { $null }
+        if (-not $venvProbe -or $LASTEXITCODE -ne 0) {
+            Write-Host "  [WARN] Warning: Virtual environment python binary unusable or blocked by Application Control policy. Falling back to host python..."
+            if (Test-Path $VenvDir) { Remove-Item -Path $VenvDir -Recurse -Force -ErrorAction SilentlyContinue }
+            $UseVenv = $false
+        } else {
+            Write-Host "  [OK] Virtual environment verified: $VenvDir"
 
-        $PipExec = Join-Path $VenvDir "Scripts\pip.exe"
-        if (Test-Path $PipExec) {
-            Write-Host "  Checking optional acceleration packages in .venv (google-auth, pyyaml)..."
-            & $PipExec install --quiet google-auth pyyaml 2>$null
+            $PipExec = Join-Path $VenvDir "Scripts\pip.exe"
+            if (Test-Path $PipExec) {
+                Write-Host "  Checking optional acceleration packages in .venv (google-auth, pyyaml)..."
+                $null = Invoke-NativeSilent $PipExec "install" "--quiet" "google-auth" "pyyaml"
+            }
         }
     }
 }
@@ -310,10 +341,10 @@ if (-not (Get-Command gcloud -ErrorAction SilentlyContinue)) {
 }
 
 $GcloudBin = (Get-Command gcloud).Source
-$GcloudVer = (& gcloud --version 2>$null | Select-Object -First 1)
-$GcloudAccount = (& gcloud config get-value account 2>$null)
+$GcloudVer = (Invoke-NativeSilent "gcloud" "--version" | Select-Object -First 1)
+$GcloudAccount = (Invoke-NativeSilent "gcloud" "config" "get-value" "account" | Select-Object -First 1)
 if (-not $GcloudAccount) { $GcloudAccount = "(none)" }
-$GcloudProject = (& gcloud config get-value project 2>$null)
+$GcloudProject = (Invoke-NativeSilent "gcloud" "config" "get-value" "project" | Select-Object -First 1)
 if (-not $GcloudProject) { $GcloudProject = "(none)" }
 Write-Host "  [OK] gcloud CLI verified: $GcloudBin ($GcloudVer)"
 Write-Host "    Active gcloud Account : $GcloudAccount"
@@ -360,9 +391,9 @@ if ($SkipAuth) {
 
 # Acquire token into environment if available
 if (-not $env:GOOGLE_OAUTH_ACCESS_TOKEN -and -not $env:GCP_ACCESS_TOKEN) {
-    $Token = (& gcloud auth application-default print-access-token 2>$null)
+    $Token = (Invoke-NativeSilent "gcloud" "auth" "application-default" "print-access-token" | Select-Object -First 1)
     if (-not $Token) {
-        $Token = (& gcloud auth print-access-token 2>$null)
+        $Token = (Invoke-NativeSilent "gcloud" "auth" "print-access-token" | Select-Object -First 1)
     }
     if ($Token) {
         $env:GOOGLE_OAUTH_ACCESS_TOKEN = $Token.Trim()
@@ -370,19 +401,23 @@ if (-not $env:GOOGLE_OAUTH_ACCESS_TOKEN -and -not $env:GCP_ACCESS_TOKEN) {
 }
 
 # 2.1 Validate target GCP Project ID
-$ProjectDescribe = (& gcloud projects describe $ProjectId 2>$null)
-if ($LASTEXITCODE -ne 0 -or -not $ProjectDescribe) {
-    Write-Host "[ERROR] Error: Project ID '$ProjectId' was not found or permission denied." -ForegroundColor Red
-    $MatchingId = (& gcloud projects list --filter="name='$ProjectId'" --format="value(projectId)" 2>$null | Select-Object -First 1)
-    if ($MatchingId) {
-        Write-Host "   '$ProjectId' is a GCP Project Display Name, not a Project ID." -ForegroundColor Yellow
-        Write-Host "   Please specify the Project ID instead: -ProjectId $MatchingId" -ForegroundColor Yellow
-    } else {
-        Write-Host "   Please provide a valid GCP Project ID (run 'gcloud projects list' to find your project ID)." -ForegroundColor Red
+if ($SkipValidation) {
+    Write-Host "  [OK] Skipping live GCP Project ID verification (--skip-validation specified): $ProjectId"
+} else {
+    $ProjectDescribe = (Invoke-NativeSilent "gcloud" "projects" "describe" $ProjectId)
+    if ($LASTEXITCODE -ne 0 -or -not $ProjectDescribe) {
+        Write-Host "[ERROR] Error: Project ID '$ProjectId' was not found or permission denied." -ForegroundColor Red
+        $MatchingId = (Invoke-NativeSilent "gcloud" "projects" "list" "--filter=name=''$ProjectId''" "--format=value(projectId)" | Select-Object -First 1)
+        if ($MatchingId) {
+            Write-Host "   '$ProjectId' is a GCP Project Display Name, not a Project ID." -ForegroundColor Yellow
+            Write-Host "   Please specify the Project ID instead: -ProjectId $MatchingId" -ForegroundColor Yellow
+        } else {
+            Write-Host "   Please provide a valid GCP Project ID (run 'gcloud projects list' to find your project ID)." -ForegroundColor Red
+        }
+        exit 1
     }
-    exit 1
+    Write-Host "  [OK] Target GCP Project ID verified: $ProjectId"
 }
-Write-Host "  [OK] Target GCP Project ID verified: $ProjectId"
 
 $env:MODEL_ARMOR_PROJECT_ID = $ProjectId
 
@@ -455,6 +490,7 @@ try:
         capture_output=True,
         text=True,
         check=False,
+        shell=(os.name == "nt"),
     )
     if policy_res.returncode == 0:
         policy = json.loads(policy_res.stdout)
@@ -713,7 +749,7 @@ function New-PluginDirectoryJunction {
     if (Test-Path $LinkPath) {
         $item = Get-Item $LinkPath -Force
         if ($item.LinkType) {
-            & cmd.exe /c rmdir "$LinkPath" 2>$null | Out-Null
+            $null = Invoke-NativeSilent "cmd.exe" "/c" "rmdir" "$LinkPath"
         } else {
             Remove-Item -Path $LinkPath -Recurse -Force
         }
@@ -748,7 +784,7 @@ if ($ProjectDir) {
     foreach ($gLink in $GlobalTargets) {
         if (Test-Path $gLink) {
             $item = Get-Item $gLink -Force
-            if ($item.LinkType) { & cmd.exe /c rmdir "$gLink" 2>$null | Out-Null }
+            if ($item.LinkType) { $null = Invoke-NativeSilent "cmd.exe" "/c" "rmdir" "$gLink" }
             else { Remove-Item -Path $gLink -Recurse -Force }
             Write-Host "[OK] Removed global plugin link ($gLink) to isolate within project"
         }
