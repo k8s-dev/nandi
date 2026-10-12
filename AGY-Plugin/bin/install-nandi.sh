@@ -665,15 +665,16 @@ with open(hook_path, "r") as f:
 py_cmd = ".venv/bin/python3" if use_venv.lower() == "true" else "python3"
 
 def update_cmd(cmd_str):
-    m = re.search(r'src/hooks/([a-zA-Z0-9_]+\.py)', cmd_str)
+    m = re.search(r'src/hooks/([a-zA-Z0-9_]+\.py)(.*)', cmd_str)
     if m:
-        return f"{py_cmd} src/hooks/{m.group(1)}"
+        suffix = m.group(2) or ""
+        return f"{py_cmd} src/hooks/{m.group(1)}{suffix}"
     return cmd_str
 
 for guard_name, guard_cfg in data.items():
     if not isinstance(guard_cfg, dict):
         continue
-    for stage in ["PreInvocation", "PreToolUse"]:
+    for stage in ["PreInvocation", "PreToolUse", "PostInvocation"]:
         items = guard_cfg.get(stage, [])
         for item in items:
             if isinstance(item, dict):

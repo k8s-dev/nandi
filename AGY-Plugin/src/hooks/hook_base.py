@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+import tempfile
 import time
 from typing import Any, Dict, Optional, Tuple
 
@@ -27,7 +28,10 @@ class AntigravityHookBase:
             return
 
         try:
-            raw = sys.stdin.read().strip()
+            if hasattr(sys.stdin, "buffer"):
+                raw = sys.stdin.buffer.read().decode("utf-8", errors="replace").strip()
+            else:
+                raw = sys.stdin.read().strip()
             if raw:
                 self.payload = json.loads(raw)
                 self.conversation_id = self.payload.get("conversationId", "unknown")
@@ -111,7 +115,7 @@ class AntigravityHookBase:
         safe_id = "".join(c for c in self.conversation_id if c.isalnum() or c in "-_")
         if not safe_id or safe_id == "unknown":
             safe_id = "default"
-        return f"/tmp/nandi_turn_blocked_{safe_id}.json"
+        return os.path.join(tempfile.gettempdir(), f"nandi_turn_blocked_{safe_id}.json")
 
     def mark_turn_blocked(self, reason: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Flags the current turn as blocked by security policy."""

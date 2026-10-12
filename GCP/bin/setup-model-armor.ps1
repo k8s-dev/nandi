@@ -1,4 +1,4 @@
-# ==============================================================================
+﻿# ==============================================================================
 # Google Cloud Model Armor Setup Script for Windows
 # Automates infrastructure provisioning and configuration as outlined in:
 # GCP/MODEL_ARMOR_SETUP.md
@@ -25,7 +25,7 @@ param(
     [Alias("s", "service-account")]
     [string]$ServiceAccount,
 
-    [Alias("m", "mode")]
+    [Alias("m")]
     [string]$Mode = "rest",
 
     [Alias("skip-iam")]
@@ -41,29 +41,68 @@ param(
     [switch]$SkipAuth,
 
     [Alias("h", "?")]
-    [switch]$Help
+    [switch]$Help,
+
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$RemainingArgs
 )
 
 $ErrorActionPreference = "Stop"
 
-# Parse POSIX-style CLI arguments (--project-id, -p, etc.) passed via $args if not bound
-for ($i = 0; $i -lt $args.Count; $i++) {
-    $arg = $args[$i]
+function Invoke-NativeSilent {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(ValueFromRemainingArguments = $true)][string[]]$ArgumentList
+    )
+    $prevPref = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $output = & $FilePath @ArgumentList 2>$null
+        return $output
+    } catch {
+        return $null
+    } finally {
+        $ErrorActionPreference = $prevPref
+    }
+}
+
+function Invoke-EmbeddedPython {
+    param(
+        [Parameter(Mandatory = $true)][string]$PythonBin,
+        [Parameter(Mandatory = $true)][string]$ScriptContent,
+        [string[]]$ScriptArgs = @()
+    )
+    $tmpDir = if ($env:TEMP) { $env:TEMP } elseif ($env:TMP) { $env:TMP } else { $PWD.Path }
+    $tmpPy = Join-Path $tmpDir ("nandi_setup_" + $PID + "_" + (Get-Random) + ".py")
+    Set-Content -Path $tmpPy -Value $ScriptContent -Encoding UTF8
+    try {
+        & $PythonBin $tmpPy @ScriptArgs
+    } finally {
+        if (Test-Path $tmpPy) {
+            Remove-Item -Path $tmpPy -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+if (-not $RemainingArgs) { $RemainingArgs = $args }
+# Parse POSIX-style CLI arguments (--project-id, -p, etc.) passed via $RemainingArgs if not bound
+for ($i = 0; $i -lt $RemainingArgs.Count; $i++) {
+    $arg = $RemainingArgs[$i]
     switch -Regex ($arg) {
         '^(-p|--project-id|--project)$' {
-            $i++; if ($i -lt $args.Count) { $ProjectId = $args[$i] }
+            $i++; if ($i -lt $RemainingArgs.Count) { $ProjectId = $RemainingArgs[$i] }
         }
         '^(-r|--region|--location)$' {
-            $i++; if ($i -lt $args.Count) { $Region = $args[$i] }
+            $i++; if ($i -lt $RemainingArgs.Count) { $Region = $RemainingArgs[$i] }
         }
         '^(-t|--template|--template-id)$' {
-            $i++; if ($i -lt $args.Count) { $TemplateId = $args[$i] }
+            $i++; if ($i -lt $RemainingArgs.Count) { $TemplateId = $RemainingArgs[$i] }
         }
         '^(-s|--service-account)$' {
-            $i++; if ($i -lt $args.Count) { $ServiceAccount = $args[$i] }
+            $i++; if ($i -lt $RemainingArgs.Count) { $ServiceAccount = $RemainingArgs[$i] }
         }
         '^(-m|--mode)$' {
-            $i++; if ($i -lt $args.Count) { $Mode = $args[$i] }
+            $i++; if ($i -lt $RemainingArgs.Count) { $Mode = $RemainingArgs[$i] }
         }
         '^(--skip-iam)$' {
             $SkipIam = $true
@@ -138,27 +177,31 @@ Write-Host "============================================================"
 
 # 1.1 Verify CLI tool availability
 if (-not (Get-Command gcloud -ErrorAction SilentlyContinue)) {
-    Write-Host "❌ Error: 'gcloud' CLI is not installed or not on PATH." -ForegroundColor Red
+    Write-Host "[ERROR] Error: 'gcloud' CLI is not installed or not on PATH." -ForegroundColor Red
     Write-Host "   Please install Google Cloud SDK: https://cloud.google.com/sdk/docs/install" -ForegroundColor Red
     exit 1
 }
 
 $HostPython = $null
-if (Get-Command python -ErrorAction SilentlyContinue) {
-    $HostPython = "python"
-} elseif (Get-Command py -ErrorAction SilentlyContinue) {
-    $HostPython = "py"
-} elseif (Get-Command python3 -ErrorAction SilentlyContinue) {
-    $HostPython = "python3"
-} else {
-    Write-Host "❌ Error: 'python' is not installed or not on PATH." -ForegroundColor Red
+foreach ($candidate in @("python", "py", "python3")) {
+    $cmdInfo = Get-Command $candidate -ErrorAction SilentlyContinue
+    if ($cmdInfo -and $cmdInfo.Source -notlike "*\WindowsApps\*") {
+        $verProbe = Invoke-NativeSilent $cmdInfo.Source "--version"
+        if ($LASTEXITCODE -eq 0 -and $verProbe) {
+            $HostPython = $cmdInfo.Source
+            break
+        }
+    }
+}
+if (-not $HostPython) {
+    Write-Host "[ERROR] Error: 'python' is not installed or not on PATH." -ForegroundColor Red
     Write-Host "   Please install Python: https://www.python.org/downloads/windows/" -ForegroundColor Red
     exit 1
 }
 
 # 1.2 Validate mandatory target project ID
 if (-not $ProjectId) {
-    Write-Host "❌ Error: Missing mandatory option: -ProjectId, -p, --project-id PROJECT_ID" -ForegroundColor Red
+    Write-Host "[ERROR] Error: Missing mandatory option: -ProjectId, -p, --project-id PROJECT_ID" -ForegroundColor Red
     Write-Host "   A valid GCP Project ID must be explicitly provided.`n" -ForegroundColor Red
     Show-Usage
     exit 1
@@ -171,7 +214,7 @@ if ($Region -eq "global") {
     $Endpoint = "modelarmor.$Region.rep.googleapis.com"
 }
 
-$ActiveAccount = (& gcloud config get-value account 2>$null)
+$ActiveAccount = (Invoke-NativeSilent "gcloud" "config" "get-value" "account" | Select-Object -First 1)
 if (-not $ActiveAccount) { $ActiveAccount = "(none)" }
 
 Write-Host "Target Project ID        : $ProjectId"
@@ -186,9 +229,9 @@ Write-Host "============================================================"
 function Get-GcpAccessToken {
     if ($env:GOOGLE_OAUTH_ACCESS_TOKEN) { return $env:GOOGLE_OAUTH_ACCESS_TOKEN.Trim() }
     if ($env:GCP_ACCESS_TOKEN) { return $env:GCP_ACCESS_TOKEN.Trim() }
-    $t = (& gcloud auth print-access-token 2>$null)
+    $t = (Invoke-NativeSilent "gcloud" "auth" "print-access-token" | Select-Object -First 1)
     if (-not $t) {
-        $t = (& gcloud auth application-default print-access-token 2>$null)
+        $t = (Invoke-NativeSilent "gcloud" "auth" "application-default" "print-access-token" | Select-Object -First 1)
     }
     if ($t) { return $t.Trim() }
     return $null
@@ -197,33 +240,33 @@ function Get-GcpAccessToken {
 $Token = Get-GcpAccessToken
 if (-not $Token) {
     if ($SkipAuth) {
-        Write-Host "❌ Error: No valid GCP OAuth token found and --skip-auth was specified." -ForegroundColor Red
+        Write-Host "[ERROR] Error: No valid GCP OAuth token found and --skip-auth was specified." -ForegroundColor Red
         exit 1
     }
 
-    Write-Host "`nℹ No active GCP OAuth token found. Initiating authentication..."
+    Write-Host "`n[INFO] No active GCP OAuth token found. Initiating authentication..."
     & gcloud auth application-default login
     $Token = Get-GcpAccessToken
     if (-not $Token) {
-        Write-Host "❌ Error: Failed to acquire GCP OAuth token after authentication attempt." -ForegroundColor Red
+        Write-Host "[ERROR] Error: Failed to acquire GCP OAuth token after authentication attempt." -ForegroundColor Red
         exit 1
     }
 }
 $env:GOOGLE_OAUTH_ACCESS_TOKEN = $Token
-Write-Host "✓ GCP OAuth authentication verified (Token acquired)."
+Write-Host "[OK] GCP OAuth authentication verified (Token acquired)."
 
 # 1.5 Validate target GCP Project ID
-$ProjectCheck = (& gcloud projects describe $ProjectId 2>$null)
+$ProjectCheck = (Invoke-NativeSilent "gcloud" "projects" "describe" $ProjectId)
 if ($LASTEXITCODE -ne 0 -or -not $ProjectCheck) {
-    Write-Host "❌ Error: Project ID '$ProjectId' was not found or permission denied." -ForegroundColor Red
-    $MatchingId = (& gcloud projects list --filter="name='$ProjectId'" --format="value(projectId)" 2>$null | Select-Object -First 1)
+    Write-Host "[ERROR] Error: Project ID '$ProjectId' was not found or permission denied." -ForegroundColor Red
+    $MatchingId = (Invoke-NativeSilent "gcloud" "projects" "list" "--filter=name=$ProjectId" "--format=value(projectId)" | Select-Object -First 1)
     if ($MatchingId) {
         Write-Host "   '$ProjectId' is a GCP Project Display Name, not a Project ID." -ForegroundColor Yellow
         Write-Host "   Please specify the Project ID instead: -ProjectId $MatchingId" -ForegroundColor Yellow
     }
     exit 1
 }
-Write-Host "✓ Target GCP Project ID verified: $ProjectId"
+Write-Host "[OK] Target GCP Project ID verified: $ProjectId"
 
 # ------------------------------------------------------------------------------
 # 2. Enable Required Google Cloud APIs
@@ -231,7 +274,7 @@ Write-Host "✓ Target GCP Project ID verified: $ProjectId"
 Write-Host "`n[Step 1/4] Enabling Google Cloud Service APIs..."
 
 if ($SkipApi) {
-    Write-Host "  ✓ Skipping API enablement (--skip-api specified)."
+    Write-Host "  [OK] Skipping API enablement (--skip-api specified)."
 } else {
     $ApisToEnable = @(
         "modelarmor.googleapis.com",
@@ -239,8 +282,8 @@ if ($SkipApi) {
         "logging.googleapis.com"
     )
     Write-Host "  Enabling APIs on project '$ProjectId': $($ApisToEnable -join ', ')..."
-    & gcloud services enable $ApisToEnable --project="$ProjectId"
-    Write-Host "  ✓ Google Cloud APIs successfully enabled."
+    $null = Invoke-NativeSilent "gcloud" "services" "enable" "modelarmor.googleapis.com" "dlp.googleapis.com" "logging.googleapis.com" "--project=$ProjectId"
+    Write-Host "  [OK] Google Cloud APIs successfully enabled."
 }
 
 # ------------------------------------------------------------------------------
@@ -249,41 +292,28 @@ if ($SkipApi) {
 Write-Host "`n[Step 2/4] Configuring IAM RBAC Permissions..."
 
 if ($SkipIam) {
-    Write-Host "  ✓ Skipping IAM role assignment (--skip-iam specified)."
+    Write-Host "  [OK] Skipping IAM role assignment (--skip-iam specified)."
 } else {
     if ($ActiveAccount -and $ActiveAccount -ne "(none)") {
         Write-Host "  Granting Model Armor roles to active user: $ActiveAccount..."
-        & gcloud projects add-iam-policy-binding "$ProjectId" `
-            --member="user:$ActiveAccount" `
-            --role="roles/modelarmor.user" `
-            --condition=None --quiet 2>$null | Out-Null
-
-        & gcloud projects add-iam-policy-binding "$ProjectId" `
-            --member="user:$ActiveAccount" `
-            --role="roles/modelarmor.viewer" `
-            --condition=None --quiet 2>$null | Out-Null
-        Write-Host "  ✓ Model Armor User and Viewer roles granted to user:$ActiveAccount"
+        $null = Invoke-NativeSilent "gcloud" "projects" "add-iam-policy-binding" "$ProjectId" "--member=user:$ActiveAccount" "--role=roles/modelarmor.user" "--condition=None" "--quiet"
+        $null = Invoke-NativeSilent "gcloud" "projects" "add-iam-policy-binding" "$ProjectId" "--member=user:$ActiveAccount" "--role=roles/modelarmor.viewer" "--condition=None" "--quiet"
+        Write-Host "  [OK] Model Armor User and Viewer roles granted to user:$ActiveAccount"
     }
 
     if ($ServiceAccount) {
         Write-Host "  Configuring service account permissions: $ServiceAccount..."
-        $saCheck = (& gcloud iam service-accounts describe "$ServiceAccount" --project="$ProjectId" 2>$null)
+        $saCheck = (Invoke-NativeSilent "gcloud" "iam" "service-accounts" "describe" "$ServiceAccount" "--project=$ProjectId")
         if ($LASTEXITCODE -ne 0 -or -not $saCheck) {
             $saName = ($ServiceAccount -split "@")[0]
             Write-Host "  Service account not found. Creating service account '$saName' in project '$ProjectId'..."
-            & gcloud iam service-accounts create "$saName" `
-                --project="$ProjectId" `
-                --display-name="Nandi Guard Agent SA" `
-                --description="Dedicated service account for Nandi Model Armor and Cloud DLP integration" 2>$null | Out-Null
+            $null = Invoke-NativeSilent "gcloud" "iam" "service-accounts" "create" "$saName" "--project=$ProjectId" "--display-name=Nandi Guard Agent SA" "--description=Dedicated service account for Nandi Model Armor and Cloud DLP integration"
         }
 
         foreach ($role in @("roles/modelarmor.user", "roles/modelarmor.viewer", "roles/logging.logWriter")) {
-            & gcloud projects add-iam-policy-binding "$ProjectId" `
-                --member="serviceAccount:$ServiceAccount" `
-                --role="$role" `
-                --condition=None --quiet 2>$null | Out-Null
+            $null = Invoke-NativeSilent "gcloud" "projects" "add-iam-policy-binding" "$ProjectId" "--member=serviceAccount:$ServiceAccount" "--role=$role" "--condition=None" "--quiet"
         }
-        Write-Host "  ✓ Granted roles/modelarmor.user, viewer, and logWriter to serviceAccount:$ServiceAccount"
+        Write-Host "  [OK] Granted roles/modelarmor.user, viewer, and logWriter to serviceAccount:$ServiceAccount"
     }
 }
 
@@ -295,7 +325,7 @@ Write-Host "`n[Step 3/4] Deploying Model Armor Template '$TemplateId'..."
 if ($Mode.ToLower() -eq "terraform") {
     Write-Host "  Executing Terraform deployment in GCP\terraform..."
     if (-not (Get-Command terraform -ErrorAction SilentlyContinue)) {
-        Write-Host "❌ Error: 'terraform' CLI is not installed or not on PATH." -ForegroundColor Red
+        Write-Host "[ERROR] Error: 'terraform' CLI is not installed or not on PATH." -ForegroundColor Red
         exit 1
     }
 
@@ -313,7 +343,7 @@ if ($Mode.ToLower() -eq "terraform") {
             -var="project_id=$ProjectId" `
             -var="region=$Region" `
             -var="template_id=$TemplateId"
-        Write-Host "  ✓ Terraform deployment finished successfully."
+        Write-Host "  [OK] Terraform deployment finished successfully."
     } finally {
         Pop-Location
     }
@@ -393,7 +423,7 @@ data = {
 }
 print(json.dumps(data))
 '@
-    $Payload = & $HostPython -c $GenPayloadScript $Region ([string]$IncludeMaliciousUri)
+    $Payload = (Invoke-EmbeddedPython -PythonBin $HostPython -ScriptContent $GenPayloadScript -ScriptArgs @($Region, ([string]$IncludeMaliciousUri)))
 
     $HeadersWithContent = @{
         "Authorization" = "Bearer $Token"
@@ -402,26 +432,26 @@ print(json.dumps(data))
     }
 
     if ($TemplateExists -or $HttpStatus -eq 200) {
-        Write-Host "  ✓ Model Armor Template '$TemplateId' already exists (HTTP 200)."
+        Write-Host "  [OK] Model Armor Template '$TemplateId' already exists (HTTP 200)."
         Write-Host "  Synchronizing template filter settings via PATCH..."
         $PatchUrl = "$TemplateUrl`?updateMask=filter_config,template_metadata"
         try {
             $null = Invoke-RestMethod -Uri $PatchUrl -Headers $HeadersWithContent -Method Patch -Body $Payload
-            Write-Host "  ✓ Model Armor Template filter settings synchronized successfully."
+            Write-Host "  [OK] Model Armor Template filter settings synchronized successfully."
         } catch {
-            Write-Host "  ⚠️ Note: PATCH request returned note: $($_.Exception.Message). Proceeding..."
+            Write-Host "  [WARN] Note: PATCH request returned note: $($_.Exception.Message). Proceeding..."
         }
     } elseif ($HttpStatus -eq 404) {
         Write-Host "  Template not found. Creating new Model Armor template '$TemplateId'..."
         try {
             $null = Invoke-RestMethod -Uri $CreateUrl -Headers $HeadersWithContent -Method Post -Body $Payload
-            Write-Host "  ✓ Successfully created Model Armor Template '$TemplateId'!"
+            Write-Host "  [OK] Successfully created Model Armor Template '$TemplateId'!"
         } catch {
-            Write-Host "❌ Error: Failed to create Model Armor Template: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "[ERROR] Error: Failed to create Model Armor Template: $($_.Exception.Message)" -ForegroundColor Red
             exit 1
         }
     } else {
-        Write-Host "❌ Error querying Model Armor Template endpoint (HTTP $HttpStatus)" -ForegroundColor Red
+        Write-Host "[ERROR] Error querying Model Armor Template endpoint (HTTP $HttpStatus)" -ForegroundColor Red
         exit 1
     }
 }
@@ -432,7 +462,7 @@ print(json.dumps(data))
 Write-Host "`n[Step 4/4] Verifying Live Prompt Sanitization Endpoint..."
 
 if ($SkipTest) {
-    Write-Host "  ✓ Skipping live prompt sanitization test (--skip-test specified)."
+    Write-Host "  [OK] Skipping live prompt sanitization test (--skip-test specified)."
 } else {
     $TestUrl = "https://$Endpoint/v1/projects/$ProjectId/locations/$Region/templates/${TemplateId}:sanitizeUserPrompt"
     $TestPayload = @'
@@ -457,11 +487,12 @@ if ($SkipTest) {
     try {
         $TestResp = Invoke-RestMethod -Uri $TestUrl -Headers $HeadersWithContent -Method Post -Body $TestPayload
         $RawJson = $TestResp | ConvertTo-Json -Depth 10
+        $env:NANDI_VERIFY_JSON = $RawJson
 
         $VerifyScript = @'
-import json, sys
+import json, os, sys
 
-raw = sys.argv[1]
+raw = os.environ.get("NANDI_VERIFY_JSON", "") or (sys.argv[1] if len(sys.argv) > 1 else "")
 try:
     data = json.loads(raw)
 except Exception as e:
@@ -473,7 +504,7 @@ match_state = res.get("filterMatchState", res.get("filter_match_state", "UNKNOWN
 inv_res = res.get("invocationResult", res.get("invocation_result", "UNKNOWN"))
 filter_res = res.get("filterResults", res.get("filter_results", {}))
 
-print(f"  ✓ Live Model Armor API Call Succeeded (HTTP 200)!")
+print(f"  [OK] Live Model Armor API Call Succeeded (HTTP 200)!")
 print(f"    Filter Match State : {match_state}")
 print(f"    Invocation Result  : {inv_res}")
 
@@ -482,23 +513,24 @@ if pi_res:
     pi_detail = pi_res.get("piAndJailbreakFilterResult", pi_res.get("pi_and_jailbreak_filter_result", {}))
     conf = pi_detail.get("confidenceLevel", pi_detail.get("confidence_level", "N/A"))
     score = pi_detail.get("score", "N/A")
-    print(f"    ✓ Prompt Injection Detected: Match={pi_detail.get('matchState', pi_detail.get('match_state'))} (Confidence: {conf}, Score: {score})")
+    print(f"    [OK] Prompt Injection Detected: Match={pi_detail.get('matchState', pi_detail.get('match_state'))} (Confidence: {conf}, Score: {score})")
 
 rai_res = filter_res.get("rai", filter_res.get("rai_filter_result", {}))
 if rai_res:
-    print(f"    ✓ Responsible AI (RAI) Filter: Active")
+    print(f"    [OK] Responsible AI (RAI) Filter: Active")
 
-print("\n  Security Gate Verification: PASSED ✅")
+print("\n  Security Gate Verification: PASSED [PASS]")
 '@
-        & $HostPython -c $VerifyScript $RawJson
+        Invoke-EmbeddedPython -PythonBin $HostPython -ScriptContent $VerifyScript
+        Remove-Item Env:\NANDI_VERIFY_JSON -ErrorAction SilentlyContinue
     } catch {
-        Write-Host "❌ Error: Prompt sanitization call failed: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "[ERROR] Error: Prompt sanitization call failed: $($_.Exception.Message)" -ForegroundColor Red
         exit 1
     }
 }
 
 Write-Host "`n============================================================"
-Write-Host "🎉 Google Cloud Model Armor Setup Completed Successfully!" -ForegroundColor Green
+Write-Host "[OK] Google Cloud Model Armor Setup Completed Successfully!" -ForegroundColor Green
 Write-Host "============================================================"
 Write-Host "Template Resource Name: projects/$ProjectId/locations/$Region/templates/$TemplateId"
 Write-Host "Regional REP Endpoint : $Endpoint"

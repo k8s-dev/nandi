@@ -3,9 +3,11 @@
 import dataclasses
 import json
 import os
+import shutil
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Dict, Optional
 
@@ -138,8 +140,57 @@ class ModelArmorClient:
         except Exception:
             pass
 
-        # 4. Fallback to gcloud CLI with 4.0s timeout (gcloud takes ~1.3s-2.5s on gLinux)
-        for cmd in (["gcloud", "auth", "print-access-token"], ["gcloud", "auth", "application-default", "print-access-token"]):
+        # 3b. Dependency-free stdlib ADC refresh (works in clean .venv without requests and uses Windows OS cert store for Zscaler)
+        adc_candidates = []
+        if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+            adc_candidates.append(os.environ["GOOGLE_APPLICATION_CREDENTIALS"])
+        if os.environ.get("CLOUDSDK_CONFIG"):
+            adc_candidates.append(os.path.join(os.environ["CLOUDSDK_CONFIG"], "application_default_credentials.json"))
+        if os.name == "nt" and os.environ.get("APPDATA"):
+            adc_candidates.append(os.path.join(os.environ["APPDATA"], "gcloud", "application_default_credentials.json"))
+        adc_candidates.append(os.path.expanduser("~/.config/gcloud/application_default_credentials.json"))
+
+        for adc_path in adc_candidates:
+            if adc_path and os.path.exists(adc_path):
+                try:
+                    with open(adc_path, "r", encoding="utf-8") as f:
+                        adc_data = json.load(f)
+                    if (
+                        adc_data.get("type") == "authorized_user"
+                        and adc_data.get("client_id")
+                        and adc_data.get("client_secret")
+                        and adc_data.get("refresh_token")
+                    ):
+                        token_url = adc_data.get("token_uri", "https://oauth2.googleapis.com/token")
+                        form_body = urllib.parse.urlencode({
+                            "client_id": adc_data["client_id"],
+                            "client_secret": adc_data["client_secret"],
+                            "refresh_token": adc_data["refresh_token"],
+                            "grant_type": "refresh_token",
+                        }).encode("utf-8")
+                        req = urllib.request.Request(
+                            token_url,
+                            data=form_body,
+                            headers={"Content-Type": "application/x-www-form-urlencoded"},
+                            method="POST",
+                        )
+                        with urllib.request.urlopen(req, timeout=4.0) as resp:
+                            tok_resp = json.loads(resp.read().decode("utf-8"))
+                            access_tok = tok_resp.get("access_token", "").strip()
+                            if access_tok:
+                                ModelArmorClient._cached_token = access_tok
+                                ModelArmorClient._auth_attempted = True
+                                return ModelArmorClient._cached_token
+                except Exception:
+                    pass
+
+        # 4. Fallback to gcloud CLI with 4.0s timeout (resolve gcloud.cmd on Windows so CreateProcess succeeds)
+        gcloud_bin = (
+            (shutil.which("gcloud.cmd") or shutil.which("gcloud") or "gcloud.cmd")
+            if os.name == "nt"
+            else (shutil.which("gcloud") or "gcloud")
+        )
+        for cmd in ([gcloud_bin, "auth", "print-access-token"], [gcloud_bin, "auth", "application-default", "print-access-token"]):
             try:
                 res = subprocess.run(
                     cmd,
