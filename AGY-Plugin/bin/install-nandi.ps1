@@ -271,8 +271,8 @@ if ($UseVenv) {
 
             $PipExec = Join-Path $VenvDir "Scripts\pip.exe"
             if (Test-Path $PipExec) {
-                Write-Host "  Checking optional acceleration packages in .venv (google-auth, pyyaml)..."
-                $null = Invoke-NativeSilent $PipExec "install" "--quiet" "google-auth" "pyyaml"
+                Write-Host "  Checking optional acceleration packages in .venv (google-auth, requests, pyyaml)..."
+                $null = Invoke-NativeSilent $PipExec "install" "--quiet" "google-auth" "requests" "pyyaml"
             }
         }
     }
@@ -683,36 +683,24 @@ print(f"    Response Latency  : {resp.latency_ms}ms")
 # ------------------------------------------------------------------------------
 Write-Host "`n[Step 4/5] Configuring Lifecycle Hooks & Permissions..."
 
-if ($RunTests) {
-    $TestRunner = Join-Path $RepoRoot "tests\run_all_tests.py"
-    if (Test-Path $TestRunner) {
-        Write-Host "  Running complete unit test suite (--run-tests specified)..."
-        & $PythonExec $TestRunner
-        if ($LASTEXITCODE -ne 0) { exit 1 }
-        Write-Host "[OK] All unit tests passed successfully"
-    } else {
-        Write-Host "[INFO] Note: Unit tests are not included in the release distribution (available in the source repository)."
-    }
-} else {
-    Write-Host "[OK] Model Armor connectivity verified in Step 3; full test suite skipped during installation."
-}
-
 # Configure hooks.json for Windows execution environment
 $HooksJsonPath = Join-Path $PluginRoot "hooks.json"
 $HooksUpdateScript = @'
 import json, re, sys
 
 hook_path, use_venv_str = sys.argv[1], sys.argv[2]
+host_py_cmd = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else "python"
 with open(hook_path, "r", encoding="utf-8") as f:
     data = json.load(f)
 
 # On Windows, virtual environments use Scripts\python.exe
-py_cmd = ".venv\\Scripts\\python.exe" if use_venv_str.lower() == "true" else "python"
+py_cmd = ".venv\\Scripts\\python.exe" if use_venv_str.lower() == "true" else host_py_cmd
 
 def update_cmd(cmd_str):
-    m = re.search(r'src/hooks/([a-zA-Z0-9_]+\.py)', cmd_str.replace("\\", "/"))
+    m = re.search(r'src/hooks/([a-zA-Z0-9_]+\.py)(.*)', cmd_str.replace("\\", "/"))
     if m:
-        return f"{py_cmd} src/hooks/{m.group(1)}"
+        suffix = m.group(2) or ""
+        return f"{py_cmd} src/hooks/{m.group(1)}{suffix}"
     return cmd_str
 
 for guard_name, guard_cfg in data.items():
@@ -732,11 +720,27 @@ with open(hook_path, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2)
     f.write("\n")
 '@
-Invoke-EmbeddedPython -PythonBin $PythonExec -ScriptContent $HooksUpdateScript -ScriptArgs @($HooksJsonPath, ([string]$UseVenv))
+
+if ($RunTests) {
+    $TestRunner = Join-Path $RepoRoot "tests\run_all_tests.py"
+    if (Test-Path $TestRunner) {
+        Invoke-EmbeddedPython -PythonBin $PythonExec -ScriptContent $HooksUpdateScript -ScriptArgs @($HooksJsonPath, "True", $HostPythonCmd)
+        Write-Host "  Running complete unit test suite (--run-tests specified)..."
+        & $PythonExec $TestRunner
+        if ($LASTEXITCODE -ne 0) { exit 1 }
+        Write-Host "[OK] All unit tests passed successfully"
+    } else {
+        Write-Host "[INFO] Note: Unit tests are not included in the release distribution (available in the source repository)."
+    }
+} else {
+    Write-Host "[OK] Model Armor connectivity verified in Step 3; full test suite skipped during installation."
+}
+
+Invoke-EmbeddedPython -PythonBin $PythonExec -ScriptContent $HooksUpdateScript -ScriptArgs @($HooksJsonPath, ([string]$UseVenv), $HostPythonCmd)
 if ($UseVenv) {
     Write-Host "[OK] Configured hooks.json to execute using Windows relative path (.venv\Scripts\python.exe)"
 } else {
-    Write-Host "[OK] Configured hooks.json to execute using relative path (python)"
+    Write-Host "[OK] Configured hooks.json to execute using relative path ($HostPythonCmd)"
 }
 
 # ------------------------------------------------------------------------------
