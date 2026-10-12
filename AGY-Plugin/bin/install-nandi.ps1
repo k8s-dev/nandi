@@ -38,6 +38,24 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Invoke-EmbeddedPython {
+    param(
+        [Parameter(Mandatory = $true)][string]$PythonBin,
+        [Parameter(Mandatory = $true)][string]$ScriptContent,
+        [string[]]$ScriptArgs = @()
+    )
+    $tmpDir = if ($env:TEMP) { $env:TEMP } elseif ($env:TMP) { $env:TMP } else { $PWD.Path }
+    $tmpPy = Join-Path $tmpDir ("nandi_step_" + $PID + "_" + (Get-Random) + ".py")
+    Set-Content -Path $tmpPy -Value $ScriptContent -Encoding UTF8
+    try {
+        & $PythonBin $tmpPy @ScriptArgs
+    } finally {
+        if (Test-Path $tmpPy) {
+            Remove-Item -Path $tmpPy -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 # Parse POSIX-style CLI arguments (--project-id, -p, etc.) passed via $args if not bound
 for ($i = 0; $i -lt $args.Count; $i++) {
     $arg = $args[$i]
@@ -113,9 +131,9 @@ $PluginRoot = (Resolve-Path (Join-Path $ScriptDir "..")).Path
 $RepoRoot = (Resolve-Path (Join-Path $PluginRoot "..")).Path
 $GcpRoot = Join-Path $RepoRoot "GCP"
 
-$UserHome = [Environment]::GetFolderPath('UserProfile')
-if (-not $UserHome) { $UserHome = $env:USERPROFILE }
+$UserHome = $env:USERPROFILE
 if (-not $UserHome) { $UserHome = $env:HOME }
+if (-not $UserHome) { $UserHome = $HOME }
 
 $GlobalTargetDir1 = Join-Path $UserHome ".gemini\antigravity\plugins"
 $GlobalTargetDir2 = Join-Path $UserHome ".gemini\config\plugins"
@@ -263,7 +281,7 @@ if missing:
     sys.exit(1)
 print(f"  [OK] Requisite Python standard libraries verified ({len(required_modules)} modules) in {sys.executable}")
 '@
-& $PythonExec -c $StdlibCheck
+Invoke-EmbeddedPython -PythonBin $PythonExec -ScriptContent $StdlibCheck
 if ($LASTEXITCODE -ne 0) { exit 1 }
 
 # 1.4 Optional acceleration & configuration packages check in PythonExec
@@ -281,7 +299,7 @@ try:
 except ImportError:
     print("  [INFO] pyyaml not installed in runtime (standard JSON fallback configuration parser active)")
 '@
-& $PythonExec -c $OptCheck
+Invoke-EmbeddedPython -PythonBin $PythonExec -ScriptContent $OptCheck
 
 # 1.5 Google Cloud SDK (gcloud CLI) verification
 if (-not (Get-Command gcloud -ErrorAction SilentlyContinue)) {
@@ -379,7 +397,7 @@ new_content = re.sub(r'(project_id:\s*)["\'][^"\']+["\']', rf'\g<1>"{project_id}
 with open(cfg_path, "w", encoding="utf-8") as f:
     f.write(new_content)
 '@
-& $PythonExec -c $UpdateYamlScript $ConfigYamlPath $ProjectId
+Invoke-EmbeddedPython -PythonBin $PythonExec -ScriptContent $UpdateYamlScript -ScriptArgs @($ConfigYamlPath, $ProjectId)
 Write-Host "  [OK] Configured Model Armor project_id in config/config.yaml"
 
 # 2.2 Google Cloud IAM Role & Effective Permissions Validation
@@ -501,7 +519,7 @@ if not iam_result.get("success"):
 
 print("  [OK] IAM prerequisite roles and effective permissions successfully verified for user/groups.")
 '@
-    & $PythonExec -c $IamCheckScript $PluginRoot $ProjectId
+    Invoke-EmbeddedPython -PythonBin $PythonExec -ScriptContent $IamCheckScript -ScriptArgs @($PluginRoot, $ProjectId)
     if ($LASTEXITCODE -ne 0) { exit 1 }
 }
 
@@ -620,7 +638,7 @@ print(f"    Invocation Result : {resp.invocation_result}")
 print(f"    Filter Match State: {resp.filter_match_state}")
 print(f"    Response Latency  : {resp.latency_ms}ms")
 '@
-    & $PythonExec -c $DiagScript $PluginRoot $GcpRoot
+    Invoke-EmbeddedPython -PythonBin $PythonExec -ScriptContent $DiagScript -ScriptArgs @($PluginRoot, $GcpRoot)
     if ($LASTEXITCODE -ne 0) { exit 1 }
 }
 
@@ -678,7 +696,7 @@ with open(hook_path, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2)
     f.write("\n")
 '@
-& $PythonExec -c $HooksUpdateScript $HooksJsonPath ([string]$UseVenv)
+Invoke-EmbeddedPython -PythonBin $PythonExec -ScriptContent $HooksUpdateScript -ScriptArgs @($HooksJsonPath, ([string]$UseVenv))
 if ($UseVenv) {
     Write-Host "[OK] Configured hooks.json to execute using Windows relative path (.venv\Scripts\python.exe)"
 } else {
@@ -695,7 +713,7 @@ function New-PluginDirectoryJunction {
     if (Test-Path $LinkPath) {
         $item = Get-Item $LinkPath -Force
         if ($item.LinkType) {
-            [System.IO.Directory]::Delete($LinkPath)
+            & cmd.exe /c rmdir "$LinkPath" 2>$null | Out-Null
         } else {
             Remove-Item -Path $LinkPath -Recurse -Force
         }
@@ -730,7 +748,7 @@ if ($ProjectDir) {
     foreach ($gLink in $GlobalTargets) {
         if (Test-Path $gLink) {
             $item = Get-Item $gLink -Force
-            if ($item.LinkType) { [System.IO.Directory]::Delete($gLink) }
+            if ($item.LinkType) { & cmd.exe /c rmdir "$gLink" 2>$null | Out-Null }
             else { Remove-Item -Path $gLink -Recurse -Force }
             Write-Host "[OK] Removed global plugin link ($gLink) to isolate within project"
         }
@@ -773,7 +791,7 @@ with open(path, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2)
     f.write("\n")
 '@
-    & $PythonExec -c $PluginsJsonScript $PluginsJsonPath $PluginRoot
+    Invoke-EmbeddedPython -PythonBin $PythonExec -ScriptContent $PluginsJsonScript -ScriptArgs @($PluginsJsonPath, $PluginRoot)
     $DotPluginsJsonPath = Join-Path $ProjectDir ".agents\plugins.json"
     Copy-Item -Path $PluginsJsonPath -Destination $DotPluginsJsonPath -Force
     Write-Host "[OK] Configured project plugins.json at $PluginsJsonPath"
@@ -795,7 +813,7 @@ import sys
 
 config_path = sys.argv[1]
 plugin_root = sys.argv[2]
-project_dir = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else None
+project_dir = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] not in ("", "__NONE__") else None
 global_target_2 = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else None
 global_target_1 = sys.argv[5] if len(sys.argv) > 5 and sys.argv[5] else None
 
@@ -909,7 +927,8 @@ if project_dir:
         proj_added = update_config_permissions(proj_cfg)
         print(f"  [OK] Configured permissions in project config: {proj_cfg} ({proj_added} new grant(s) added)")
 '@
-& $PythonExec -c $PermScript $ConfigJsonFile $PluginRoot ($ProjectDir) (Join-Path $GlobalTargetDir2 "nandi") (Join-Path $GlobalTargetDir1 "nandi")
+$ProjectDirArg = if ($ProjectDir) { "$ProjectDir" } else { "__NONE__" }
+Invoke-EmbeddedPython -PythonBin $PythonExec -ScriptContent $PermScript -ScriptArgs @($ConfigJsonFile, $PluginRoot, $ProjectDirArg, (Join-Path $GlobalTargetDir2 "nandi"), (Join-Path $GlobalTargetDir1 "nandi"))
 
 Write-Host "`n============================================================"
 if ($ProjectDir) {
