@@ -683,6 +683,20 @@ print(f"    Response Latency  : {resp.latency_ms}ms")
 # ------------------------------------------------------------------------------
 Write-Host "`n[Step 4/5] Configuring Lifecycle Hooks & Permissions..."
 
+if ($RunTests) {
+    $TestRunner = Join-Path $RepoRoot "tests\run_all_tests.py"
+    if (Test-Path $TestRunner) {
+        Write-Host "  Running complete unit test suite (--run-tests specified)..."
+        & $PythonExec $TestRunner
+        if ($LASTEXITCODE -ne 0) { exit 1 }
+        Write-Host "[OK] All unit tests passed successfully"
+    } else {
+        Write-Host "[INFO] Note: Unit tests are not included in the release distribution (available in the source repository)."
+    }
+} else {
+    Write-Host "[OK] Model Armor connectivity verified in Step 3; full test suite skipped during installation."
+}
+
 # Configure hooks.json for Windows execution environment
 $HooksJsonPath = Join-Path $PluginRoot "hooks.json"
 $HooksUpdateScript = @'
@@ -720,22 +734,6 @@ with open(hook_path, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2)
     f.write("\n")
 '@
-
-if ($RunTests) {
-    $TestRunner = Join-Path $RepoRoot "tests\run_all_tests.py"
-    if (Test-Path $TestRunner) {
-        Invoke-EmbeddedPython -PythonBin $PythonExec -ScriptContent $HooksUpdateScript -ScriptArgs @($HooksJsonPath, "True", $HostPythonCmd)
-        Write-Host "  Running complete unit test suite (--run-tests specified)..."
-        & $PythonExec $TestRunner
-        if ($LASTEXITCODE -ne 0) { exit 1 }
-        Write-Host "[OK] All unit tests passed successfully"
-    } else {
-        Write-Host "[INFO] Note: Unit tests are not included in the release distribution (available in the source repository)."
-    }
-} else {
-    Write-Host "[OK] Model Armor connectivity verified in Step 3; full test suite skipped during installation."
-}
-
 Invoke-EmbeddedPython -PythonBin $PythonExec -ScriptContent $HooksUpdateScript -ScriptArgs @($HooksJsonPath, ([string]$UseVenv), $HostPythonCmd)
 if ($UseVenv) {
     Write-Host "[OK] Configured hooks.json to execute using Windows relative path (.venv\Scripts\python.exe)"

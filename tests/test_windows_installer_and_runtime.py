@@ -316,17 +316,17 @@ class TestWindowsInstallerAndRuntime(unittest.TestCase):
         )
 
   def test_hooks_json_update_preserves_event_flag(self):
-    """Verifies Step 3 of `install-nandi.ps1` preserves `--event=...` in `hooks.json`.
+    """Verifies Step 3 of `install-nandi.ps1` and `install-nandi.sh` preserves `--event=...` in `hooks.json`.
 
     Why this test is needed:
-    - Previously, Step 3 of `install-nandi.ps1` overwrote `entry["command"]`
-      with only `f"{venv_py} {script_path}"`, accidentally erasing the trailing
-      `--event=pre_invocation`, `--event=pre_tool_use`, and
+    - Previously, Step 3 of `install-nandi.ps1` and `install-nandi.sh` overwrote
+      `entry["command"]` with only `f"{venv_py} {script_path}"`, accidentally
+      erasing the trailing `--event=pre_invocation`, `--event=pre_tool_use`, and
       `--event=post_invocation` CLI flags from `AGY-Plugin/hooks.json`.
     - This test extracts the exact `$HooksUpdateScript` Python snippet from
-      `install-nandi.ps1`, executes it against a temporary copy of `hooks.json`,
-      and asserts that every `--event=...` argument (including `PostInvocation`)
-      is preserved.
+      `install-nandi.ps1` and the Step 2.1 Python snippet from `install-nandi.sh`,
+      executes both against temporary copies of `hooks.json`, and asserts that
+      every `--event=...` argument (including `PostInvocation`) is preserved.
     """
     install_ps1 = os.path.join(
         repo_root, "AGY-Plugin", "bin", "install-nandi.ps1"
@@ -385,6 +385,51 @@ class TestWindowsInstallerAndRuntime(unittest.TestCase):
       self.assertEqual(
           post_inv_cmd,
           ".venv\\Scripts\\python.exe src/hooks/model_armor_hook.py"
+          " --event=post_invocation",
+      )
+
+      # Also verify install-nandi.sh Step 4 preserves --event=... across all 3 stages
+      install_sh = os.path.join(
+          repo_root, "AGY-Plugin", "bin", "install-nandi.sh"
+      )
+      with open(install_sh, "r", encoding="utf-8") as f:
+        sh_content = f.read()
+      m_sh = re.search(
+          r'"\$\{PYTHON_EXEC\}" - "\$\{PLUGIN_ROOT\}/hooks\.json"'
+          r' "\$\{USE_VENV\}" <<\'PY\'\n(.*?)\nPY',
+          sh_content,
+          re.DOTALL,
+      )
+      self.assertIsNotNone(
+          m_sh, "Could not find hooks.json Python block in install-nandi.sh"
+      )
+      tmp_hooks_sh = os.path.join(tmpdir, "hooks_sh.json")
+      with open(tmp_hooks_sh, "w", encoding="utf-8") as f:
+        json.dump(orig_hooks, f)
+      res_sh = subprocess.run(
+          [sys.executable, "-c", m_sh.group(1), tmp_hooks_sh, "true"],
+          capture_output=True,
+          text=True,
+          check=True,
+      )
+      self.assertEqual(res_sh.returncode, 0)
+      with open(tmp_hooks_sh, "r", encoding="utf-8") as f:
+        updated_sh = json.load(f)
+      self.assertEqual(
+          updated_sh["fsi-model-armor-guard"]["PreInvocation"][0]["command"],
+          ".venv/bin/python3 src/hooks/model_armor_hook.py"
+          " --event=pre_invocation",
+      )
+      self.assertEqual(
+          updated_sh["fsi-model-armor-guard"]["PreToolUse"][0]["hooks"][0][
+              "command"
+          ],
+          ".venv/bin/python3 src/hooks/model_armor_hook.py"
+          " --event=pre_tool_use",
+      )
+      self.assertEqual(
+          updated_sh["fsi-model-armor-guard"]["PostInvocation"][0]["command"],
+          ".venv/bin/python3 src/hooks/model_armor_hook.py"
           " --event=post_invocation",
       )
 

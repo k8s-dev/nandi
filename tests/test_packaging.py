@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -126,10 +127,10 @@ class TestPackagingAndWindowsScripts(unittest.TestCase):
                         for itm in cfg.get(stg, []):
                             if isinstance(itm, dict):
                                 if "command" in itm:
-                                    itm["command"] = itm["command"].replace(".venv/bin/python3", ".venv\\Scripts\\python.exe")
+                                    itm["command"] = re.sub(r"^.*?src/hooks/", r".venv\\Scripts\\python.exe src/hooks/", itm["command"].replace("\\", "/"))
                                 for sub in itm.get("hooks", []):
                                     if isinstance(sub, dict) and "command" in sub:
-                                        sub["command"] = sub["command"].replace(".venv/bin/python3", ".venv\\Scripts\\python.exe")
+                                        sub["command"] = re.sub(r"^.*?src/hooks/", r".venv\\Scripts\\python.exe src/hooks/", sub["command"].replace("\\", "/"))
             with open(os.path.join(windows_client, "hooks.json"), "w") as f:
                 json.dump(hooks_data, f, indent=2)
 
