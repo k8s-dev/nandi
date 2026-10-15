@@ -256,9 +256,32 @@ $env:GOOGLE_OAUTH_ACCESS_TOKEN = $Token
 Write-Host "[OK] GCP OAuth authentication verified (Token acquired)."
 
 # 1.5 Validate target GCP Project ID
-$ProjectCheck = (Invoke-NativeSilent "gcloud" "projects" "describe" $ProjectId)
-if ($LASTEXITCODE -ne 0 -or -not $ProjectCheck) {
+$ProjectCheck = $null
+if ($ActiveAccount -and $ActiveAccount -ne "(none)") {
+    $ProjectCheck = (Invoke-NativeSilent "gcloud" "projects" "describe" $ProjectId)
+}
+
+# If gcloud CLI describe failed or gcloud is not logged in, attempt REST API check using OAuth token
+if (-not $ProjectCheck) {
+    try {
+        $rmHeaders = @{
+            "Authorization" = "Bearer $Token"
+        }
+        $restProject = Invoke-RestMethod -Uri "https://cloudresourcemanager.googleapis.com/v1/projects/$ProjectId" -Headers $rmHeaders -Method Get -ErrorAction Stop
+        if ($restProject -and $restProject.projectId -eq $ProjectId) {
+            $ProjectCheck = $restProject.projectId
+        }
+    } catch {
+        # REST check also failed
+    }
+}
+
+if (-not $ProjectCheck) {
     Write-Host "[ERROR] Error: Project ID '$ProjectId' was not found or permission denied." -ForegroundColor Red
+    if ($ActiveAccount -eq "(none)") {
+        Write-Host "   Note: 'gcloud' CLI has no active logged-in account (Active gcloud Account: (none))." -ForegroundColor Yellow
+        Write-Host "   Run 'gcloud auth login' to authenticate the gcloud CLI." -ForegroundColor Yellow
+    }
     $MatchingId = (Invoke-NativeSilent "gcloud" "projects" "list" "--filter=name=$ProjectId" "--format=value(projectId)" | Select-Object -First 1)
     if ($MatchingId) {
         Write-Host "   '$ProjectId' is a GCP Project Display Name, not a Project ID." -ForegroundColor Yellow
@@ -267,6 +290,13 @@ if ($LASTEXITCODE -ne 0 -or -not $ProjectCheck) {
     exit 1
 }
 Write-Host "[OK] Target GCP Project ID verified: $ProjectId"
+
+if ($ActiveAccount -eq "(none)") {
+    Write-Host "[WARN] Warning: 'gcloud' CLI has no active account logged in." -ForegroundColor Yellow
+    Write-Host "       gcloud CLI steps (API enablement and IAM bindings) may fail." -ForegroundColor Yellow
+    Write-Host "       To authenticate gcloud CLI, run: gcloud auth login" -ForegroundColor Yellow
+    Write-Host "       Alternatively, pass --skip-api --skip-iam if APIs and IAM are already configured.`n" -ForegroundColor Yellow
+}
 
 # ------------------------------------------------------------------------------
 # 2. Enable Required Google Cloud APIs
@@ -281,9 +311,15 @@ if ($SkipApi) {
         "dlp.googleapis.com",
         "logging.googleapis.com"
     )
-    Write-Host "  Enabling APIs on project '$ProjectId': $($ApisToEnable -join ', ')..."
-    $null = Invoke-NativeSilent "gcloud" "services" "enable" "modelarmor.googleapis.com" "dlp.googleapis.com" "logging.googleapis.com" "--project=$ProjectId"
-    Write-Host "  [OK] Google Cloud APIs successfully enabled."
+    $enableOut = Invoke-NativeSilent "gcloud" "services" "enable" "modelarmor.googleapis.com" "dlp.googleapis.com" "logging.googleapis.com" "--project=$ProjectId"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  [WARN] Note: 'gcloud services enable' returned code $LASTEXITCODE. If APIs are already enabled, you can safely continue." -ForegroundColor Yellow
+        if ($ActiveAccount -eq "(none)") {
+            Write-Host "         Run 'gcloud auth login' if you need to enable APIs via gcloud CLI." -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "  [OK] Google Cloud APIs successfully enabled."
+    }
 }
 
 # ------------------------------------------------------------------------------

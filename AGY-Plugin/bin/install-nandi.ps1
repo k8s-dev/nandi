@@ -15,6 +15,9 @@ param(
     [Alias("p", "project", "project-id", "gcp-project-id")]
     [string]$ProjectId,
 
+    [Alias("r", "location")]
+    [string]$Region,
+
     [Alias("d", "project-dir")]
     [string]$ProjectDir,
 
@@ -83,6 +86,9 @@ for ($i = 0; $i -lt $RemainingArgs.Count; $i++) {
     switch -Regex ($arg) {
         '^(-p|--project-id|--project|--gcp-project-id|-project-id)$' {
             $i++; if ($i -lt $RemainingArgs.Count) { $ProjectId = $RemainingArgs[$i] }
+        }
+        '^(-r|--region|--location|-region)$' {
+            $i++; if ($i -lt $RemainingArgs.Count) { $Region = $RemainingArgs[$i] }
         }
         '^(-d|--project-dir|-project-dir)$' {
             $i++; if ($i -lt $RemainingArgs.Count) { $ProjectDir = $RemainingArgs[$i] }
@@ -404,9 +410,32 @@ if (-not $env:GOOGLE_OAUTH_ACCESS_TOKEN -and -not $env:GCP_ACCESS_TOKEN) {
 if ($SkipValidation) {
     Write-Host "  [OK] Skipping live GCP Project ID verification (--skip-validation specified): $ProjectId"
 } else {
-    $ProjectDescribe = (Invoke-NativeSilent "gcloud" "projects" "describe" $ProjectId)
-    if ($LASTEXITCODE -ne 0 -or -not $ProjectDescribe) {
+    $ProjectDescribe = $null
+    if ($GcloudAccount -and $GcloudAccount -ne "(none)") {
+        $ProjectDescribe = (Invoke-NativeSilent "gcloud" "projects" "describe" $ProjectId)
+    }
+
+    # If gcloud CLI describe failed or gcloud is not logged in, attempt REST API check using OAuth token
+    if (-not $ProjectDescribe -and $Token) {
+        try {
+            $rmHeaders = @{
+                "Authorization" = "Bearer $Token"
+            }
+            $restProject = Invoke-RestMethod -Uri "https://cloudresourcemanager.googleapis.com/v1/projects/$ProjectId" -Headers $rmHeaders -Method Get -ErrorAction Stop
+            if ($restProject -and $restProject.projectId -eq $ProjectId) {
+                $ProjectDescribe = $restProject.projectId
+            }
+        } catch {
+            # REST check also failed
+        }
+    }
+
+    if (-not $ProjectDescribe) {
         Write-Host "[ERROR] Error: Project ID '$ProjectId' was not found or permission denied." -ForegroundColor Red
+        if ($GcloudAccount -eq "(none)") {
+            Write-Host "   Note: 'gcloud' CLI has no active logged-in account (Active gcloud Account: (none))." -ForegroundColor Yellow
+            Write-Host "   Run 'gcloud auth login' to authenticate the gcloud CLI." -ForegroundColor Yellow
+        }
         $MatchingId = (Invoke-NativeSilent "gcloud" "projects" "list" "--filter=name=''$ProjectId''" "--format=value(projectId)" | Select-Object -First 1)
         if ($MatchingId) {
             Write-Host "   '$ProjectId' is a GCP Project Display Name, not a Project ID." -ForegroundColor Yellow
@@ -420,19 +449,31 @@ if ($SkipValidation) {
 }
 
 $env:MODEL_ARMOR_PROJECT_ID = $ProjectId
+if ($Region) {
+    $env:MODEL_ARMOR_LOCATION = $Region
+    if ($Region -eq "global") {
+        $env:MODEL_ARMOR_ENDPOINT = "modelarmor.googleapis.com"
+    } else {
+        $env:MODEL_ARMOR_ENDPOINT = "modelarmor.$Region.rep.googleapis.com"
+    }
+}
 
 # Update config/config.yaml
 $ConfigYamlPath = Join-Path $PluginRoot "config\config.yaml"
 $UpdateYamlScript = @'
 import re, sys
-cfg_path, project_id = sys.argv[1], sys.argv[2]
+cfg_path, project_id, region = sys.argv[1], sys.argv[2], (sys.argv[3] if len(sys.argv) > 3 else "")
 with open(cfg_path, "r", encoding="utf-8") as f:
     content = f.read()
 new_content = re.sub(r'(project_id:\s*)["\'][^"\']+["\']', rf'\g<1>"{project_id}"', content)
+if region:
+    new_content = re.sub(r'(location:\s*)["\'][^"\']+["\']', rf'\g<1>"{region}"', new_content)
+    ep = "modelarmor.googleapis.com" if region == "global" else f"modelarmor.{region}.rep.googleapis.com"
+    new_content = re.sub(r'(endpoint:\s*)["\'][^"\']+["\']', rf'\g<1>"{ep}"', new_content)
 with open(cfg_path, "w", encoding="utf-8") as f:
     f.write(new_content)
 '@
-Invoke-EmbeddedPython -PythonBin $PythonExec -ScriptContent $UpdateYamlScript -ScriptArgs @($ConfigYamlPath, $ProjectId)
+Invoke-EmbeddedPython -PythonBin $PythonExec -ScriptContent $UpdateYamlScript -ScriptArgs @($ConfigYamlPath, $ProjectId, ([string]$Region))
 Write-Host "  [OK] Configured Model Armor project_id in config/config.yaml"
 
 # 2.2 Google Cloud IAM Role & Effective Permissions Validation
@@ -459,7 +500,20 @@ client = ModelArmorClient(project_id=project_id)
 account = os.popen("gcloud config get-value account 2>nul").read().strip()
 if not account:
     token_account = os.popen("gcloud auth list --filter=status:ACTIVE --format=\"value(account)\" 2>nul").read().strip()
-    account = token_account or "current-user"
+    account = token_account
+if not account:
+    try:
+        tok = os.environ.get("GOOGLE_OAUTH_ACCESS_TOKEN") or client._get_auth_token()
+        if tok:
+            import urllib.request, json
+            req = urllib.request.Request(f"https://oauth2.googleapis.com/tokeninfo?access_token={tok}")
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                tinfo = json.loads(resp.read().decode())
+                account = tinfo.get("email", "")
+    except Exception:
+        pass
+if not account:
+    account = "current-user"
 
 member_prefix = "serviceAccount" if "gserviceaccount.com" in account else "user"
 member_id = f"{member_prefix}:{account}"
@@ -601,6 +655,33 @@ except Exception as e:
 
 print(f"\n  Inspecting Model Armor template 'projects/{client.project_id}/locations/{client.location}/templates/{client.template_id}'...")
 template_res = client.get_template()
+
+if not template_res.get("success") and template_res.get("status_code") == 404:
+    candidates = ["us-east1", "asia-south1", "asia-south2", "us-central1", "global"]
+    for cand_loc in candidates:
+        if cand_loc == client.location:
+            continue
+        cand_res = client.get_template(location=cand_loc)
+        if cand_res.get("success"):
+            print(f"  [OK] Model Armor Template auto-detected in location '{cand_loc}'!")
+            client.location = cand_loc
+            endpoint_host = "modelarmor.googleapis.com" if cand_loc == "global" else f"modelarmor.{cand_loc}.rep.googleapis.com"
+            client.endpoint = endpoint_host
+            template_res = cand_res
+            try:
+                cfg_path = os.path.join(plugin_root, "config", "config.yaml")
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    c_content = f.read()
+                import re
+                c_content = re.sub(r'(location:\s*)["\'][^"\']+["\']', rf'\g<1>"{cand_loc}"', c_content)
+                c_content = re.sub(r'(endpoint:\s*)["\'][^"\']+["\']', rf'\g<1>"{endpoint_host}"', c_content)
+                with open(cfg_path, "w", encoding="utf-8") as f:
+                    f.write(c_content)
+                os.environ["MODEL_ARMOR_LOCATION"] = cand_loc
+                os.environ["MODEL_ARMOR_ENDPOINT"] = endpoint_host
+            except Exception:
+                pass
+            break
 
 if not template_res.get("success"):
     status_code = template_res.get("status_code", 0)
